@@ -368,7 +368,8 @@ struct ContainerContext {
 		if (handle != 0) CryptReleaseContext(handle, 0);
 	}
 
-	void discover(std::function<void(const Certificate&)> callback) {
+	int discover(std::function<void(const Certificate&)> callback) {
+		int certificates = 0;
 		CHAR szTemp[MAX_CONTAINER_NAME];
 		DWORD dwSize = sizeof(szTemp);
 		dwSize = sizeof(szTemp);
@@ -380,9 +381,11 @@ struct ContainerContext {
 		while (fSts) {
 			Key keyContainer{ reader, s2ws(szTemp) };
 			callback(keyContainer.get());
+			certificates++;
 			dwSize = sizeof(szTemp);
 			fSts = CryptGetProvParam(handle, PP_ENUMCONTAINERS, (BYTE*)szTemp, &dwSize, CRYPT_NEXT);
 		}
+		return certificates;
 	}
 };
 
@@ -428,17 +431,20 @@ struct StorageProvider {
 		if (rc != ERROR_SUCCESS) {
 			throw Failure{ L"NCryptOpenStorageProvider failed", (DWORD)rc };
 		}
-		rc = NCryptSetProperty(handle, NCRYPT_READER_PROPERTY, (PBYTE)name.c_str(), (name.size() + 1) * sizeof(WString::value_type), dwFlags);
-		if (rc != ERROR_SUCCESS) {
-			NCryptFreeObject(handle);
-			throw Failure{ L"READER_PROPERTY cannot be set", (DWORD)rc };
+		if (!name.empty()) {
+			rc = NCryptSetProperty(handle, NCRYPT_READER_PROPERTY, (PBYTE)name.c_str(), (name.size() + 1) * sizeof(WString::value_type), dwFlags);
+			if (rc != ERROR_SUCCESS) {
+				NCryptFreeObject(handle);
+				throw Failure{ L"READER_PROPERTY cannot be set", (DWORD)rc };
+			}
 		}
 	}
 	virtual ~StorageProvider() {
 		if (handle != 0) NCryptFreeObject(handle);
 	}
-	void discover(std::function<void(const Certificate&)> callback) {
+	int discover(std::function<void(const Certificate&)> callback) {
 		PVOID enumState = nullptr;
+		int certificates = 0;
 		for (;;) {
 			NCryptKeyName* keyName = nullptr;
 			DWORD dwFlags = NCRYPT_SILENT_FLAG;
@@ -450,8 +456,10 @@ struct StorageProvider {
 
 			Key providerKey{ *this, keyName->pszName };
 			callback(providerKey.get());
+			certificates++;
 			NCryptFreeBuffer(keyName);
 		}
+		return certificates;
 	}
 };
 
@@ -462,18 +470,44 @@ struct CertLoader {
 	T loader;
 	CertLoader(const WString& reader) : loader{ reader } {}
 	void discover(std::function<void(const Certificate&)> callback) {
-		loader.discover(callback);
+		// discover retry up to 1 minute
+		auto started_at = elapsed = std::chrono::steady_clock::now();
+		int count = 0;
+		do {
+			elapsed = std::chrono::steady_clock::now() - started_at;
+			if (elapsed > 1s) std::this_thread::sleep_for(1s);
+			count = loader.discover(callback);
+		} while (count == 0 && elapsed < 60s);
 	}
 };
 
 
 int main(int argc, char* argv[]) {
 	bool use_ncrypt = false;
+	bool poll_only = false;
 	if ( argc > 1 ) {
 		if (strcmp("-n", argv[1]) == 0) use_ncrypt = true;
+		if (strcmp("-p", argv[1]) == 0) {
+			use_ncrypt = true;
+			poll_only = true;
+		}
+		if (strcmp("-h", argv[1]) == 0) {
+			std::cout << "Usage: " << argv[0] << " "
+				<< "[-c|-p|-n]" << std::endl
+				<< "where" << std::endl
+				<< "-c\tUse CryptoAPI with PC/SC monitoring (default)" << std::endl
+				<< "-n\tUse NCrypt with PC/SC monitoring" << std::endl
+				<< "-p\tPoll only with NCrypt without PC/SC monitoring" << std::endl
+				<< "-h\tShow this help" << std::endl;
+			return 0;
+		}
 	}
 
-	std::cout << "Monitoring smart cards with ";
+	if (poll_only) {
+		std::cout << "Polling smart cards with ";
+	} else {
+		std::cout << "Monitoring smart cards with ";
+	}
 	if (use_ncrypt) {
 		std::cout << "NCrypt";
 	} else {
@@ -483,35 +517,47 @@ int main(int argc, char* argv[]) {
 
 	ReaderStateMonitor monitor;
 	bool run = true;
+	auto callback = [](const Certificate& c) {
+		std::wcout << L" Certificate" << std::endl
+			<< L" - subject: " << c.subject() << std::endl
+			<< L" - issuer: " << c.issuer() << std::endl
+			<< L" - serial: " << blob_to_hex<WString>(c.serial()) << std::endl;
+	};
 	while (run) {
 		try {
-			monitor.peek([use_ncrypt](auto& e) {
-				std::wcout << e.as_string() << std::endl;
-				switch (e.change) {
-				case StateChangeEvent::Change::CardInserted:
-					try {
-						std::wcout << L" ATR:" << blob_to_hex<WString>(e.atr) << std::endl;
-						auto callback = [](const Certificate& c) {
-							std::wcout << L" Certificate" << std::endl
-								<< L" - subject: " << c.subject() << std::endl
-								<< L" - issuer: " << c.issuer() << std::endl
-								<< L" - serial: " << blob_to_hex<WString>(c.serial()) << std::endl;
-						};
-
-						if (use_ncrypt) {
-							CertLoader<StorageProvider> loader{ e.reader };
-							loader.discover(callback);
-						} else {
-							CertLoader<ContainerContext> loader{ e.reader };
-							loader.discover(callback);
-						}
-					}
-					catch (const Failure& f) {
-						std::wcout << L"Error accessing card container: " << f.error << L" - 0x" << std::hex << f.code << std::endl;
-					}
-					break;
+			if (poll_only) {
+				try {
+					WString all_readers;
+					CertLoader<StorageProvider> loader{ all_readers };
+					loader.discover(callback);
 				}
-				});
+				catch (const Failure& pf) {
+					if (pf.code != SCARD_E_NO_SMARTCARD) throw pf;
+				}
+			} else {
+				monitor.peek([use_ncrypt, callback](auto& e) {
+					std::wcout << e.as_string() << std::endl;
+					switch (e.change) {
+					case StateChangeEvent::Change::CardInserted:
+						try {
+							std::wcout << L" ATR:" << blob_to_hex<WString>(e.atr) << std::endl;
+
+							if (use_ncrypt) {
+								CertLoader<StorageProvider> loader{ e.reader };
+								loader.discover(callback);
+							}
+							else {
+								CertLoader<ContainerContext> loader{ e.reader };
+								loader.discover(callback);
+							}
+						}
+						catch (const Failure& f) {
+							std::wcout << L"Error accessing card container: " << f.error << L" - 0x" << std::hex << f.code << std::endl;
+						}
+						break;
+					}
+					});
+			}
 		}
 		catch (const Failure& f) {
 			std::wcout << L"Error getting smart card status: " << f.error << L" - 0x" << std::hex << f.code << std::endl;
